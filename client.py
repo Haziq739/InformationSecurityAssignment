@@ -1,9 +1,8 @@
 # client.py
 import socket
 import json
-from app.crypto import pki
-from app.crypto import dh as dhlib
-from app.crypto import aes as aeslib
+import time
+from app.crypto import pki, dh as dhlib, aes as aeslib, sign
 import hashlib
 from cryptography import x509
 
@@ -29,32 +28,27 @@ def do_dh_and_get_key(sock):
     priv, A = dhlib.generate_private_and_public(p, g)
     msg = {"type": "dh_client", "p": str(p), "g": str(g), "A": str(A)}
     sock.send(json.dumps(msg).encode())
-
     resp = sock.recv(8192).decode()
     resp_json = json.loads(resp)
     if resp_json.get("type") != "dh_server":
         raise RuntimeError("DH failed")
     B = int(resp_json["B"])
-
     shared = dhlib.compute_shared_secret(priv, B, p, g)
-    aes_key = derive_aes_key_from_shared(shared)
-    return aes_key
+    return derive_aes_key_from_shared(shared)
 
 def do_session_dh(sock):
     p, g = dhlib.generate_parameters()
     priv, A = dhlib.generate_private_and_public(p, g)
     msg = {"type": "dh_session", "p": str(p), "g": str(g), "A": str(A)}
     sock.send(json.dumps(msg).encode())
-
     resp = sock.recv(8192).decode()
     resp_json = json.loads(resp)
     if resp_json.get("type") != "dh_session_server":
         raise RuntimeError("Session DH failed")
     B = int(resp_json["B"])
-
     shared = dhlib.compute_shared_secret(priv, B, p, g)
     session_key = derive_aes_key_from_shared(shared)
-    print(f"Session key derived: {session_key.hex()}")  # ✅ Screenshot: client session key
+    print(f"Session key derived: {session_key.hex()}")
     return session_key
 
 def encrypt_and_send_payload(sock, aes_key, payload: dict, msg_type: str):
@@ -88,10 +82,40 @@ def login_flow():
         payload = {"email": email, "password": password}
         encrypt_and_send_payload(sock, aes_key, payload, "login")
 
-        # 6️⃣ SESSION KEY DH EXCHANGE
+        # Session DH
         session_key = do_session_dh(sock)
-        # Use session_key for future chat messages (Step 4)
-        # ✅ Screenshot: session DH complete
+
+        # Load client RSA key for signing
+        private_key = sign.load_private_key("certs/client.key")
+
+        seqno = 1
+        while True:
+            message = input("Enter chat message (or 'exit'): ")
+            if message.lower() == "exit":
+                break
+            timestamp = int(time.time() * 1000)
+            plaintext = message.encode()
+            iv_b64, ct_b64 = aeslib.aes_cbc_encrypt(plaintext, session_key)
+            h = hashlib.sha256(f"{seqno}{timestamp}{ct_b64}".encode()).digest()
+            sig_b64 = sign.sign_message(private_key, h)
+            msg_json = {
+                "type": "msg",
+                "seqno": seqno,
+                "ts": timestamp,
+                "ct": ct_b64,
+                "iv": iv_b64,
+                "sig": sig_b64
+            }
+            sock.send(json.dumps(msg_json).encode())
+
+            # Receive server reply
+            reply_bytes = sock.recv(8192)
+            if reply_bytes:
+                reply_json = json.loads(reply_bytes.decode())
+                reply_plain = aeslib.aes_cbc_decrypt(reply_json["iv"], reply_json["ct"], session_key)
+                print(f"Server reply: {reply_plain.decode()}")
+
+            seqno += 1
 
 def main():
     print("Registration")

@@ -163,6 +163,8 @@ def login_flow():
                 "sig": sig_b64
             }
 
+
+
             # append this outgoing line to persistent client transcript and in-memory session_lines
             line = f"{seqno}|{timestamp}|{ct_b64}|{sig_b64}|{server_fp}"
             with open(CLIENT_TRANSCRIPT, "a", encoding="utf-8") as f:

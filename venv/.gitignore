@@ -1,9 +1,0 @@
-# Ignore certificates and keys
-certs/
-
-# Ignore Python cache files
-__pycache__/
-*.pyc
-
-# Ignore any other sensitive files
-*.env

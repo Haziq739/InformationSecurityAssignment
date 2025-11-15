@@ -2,16 +2,35 @@
 import socket
 import json
 import time
+import os
 from app.storage import db
 from app.crypto import pki, dh as dhlib, aes as aeslib, sign
 from cryptography import x509
+from cryptography.hazmat.primitives import hashes
 import hashlib
 
 HOST = '127.0.0.1'
 PORT = 12345
 
+# storage paths (as you requested)
+STORAGE_DIR = "storage"
+SERVER_TRANSCRIPT = os.path.join(STORAGE_DIR, "server_transcript.log")
+SERVER_RECEIPT = os.path.join(STORAGE_DIR, "server_receipt.json")
+
+# ensure storage directory exists
+os.makedirs(STORAGE_DIR, exist_ok=True)
+
 def derive_aes_key_from_shared(shared_bytes: bytes) -> bytes:
     return hashlib.sha256(shared_bytes).digest()[:16]
+
+def fingerprint_of_cert(cert: x509.Certificate) -> str:
+    # returns hex-encoded SHA256 fingerprint
+    fp = cert.fingerprint(hashes.SHA256())
+    return fp.hex()
+
+def append_to_file(path: str, line: str):
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(line + "\n")
 
 def handle_client(conn, addr):
     print(f"Connected: {addr}")
@@ -34,6 +53,8 @@ def handle_client(conn, addr):
         return
 
     conn.send(b"CERT OK")
+
+    client_fp = fingerprint_of_cert(client_cert)
 
     # DH key for registration/login
     dh_msg = conn.recv(8192).decode()
@@ -84,21 +105,64 @@ def handle_client(conn, addr):
             session_key = derive_aes_key_from_shared(shared_sess)
             print(f"Session key established with {addr}: {session_key.hex()}")
 
-            # Load client RSA key for verifying client messages
+            # Load client RSA key for verifying client messages (public key from cert)
             client_pub_key = client_cert.public_key()
 
             # Load server RSA key for signing replies
             server_private_key = sign.load_private_key("certs/server.key")
+
+            # in-memory session transcript lines for this session
+            session_lines = []  # will hold strings: seqno|ts|ct|sig|peer_fp
 
             last_seqno = 0
             while True:
                 try:
                     msg_bytes = conn.recv(8192)
                     if not msg_bytes:
+                        # client closed
                         break
+
                     msg_json = json.loads(msg_bytes.decode())
+
+                    # handle special 'receipt' message from client (session closure)
+                    if msg_json.get("type") == "receipt":
+                        # client sent its receipt; verify and reply with server receipt
+                        client_receipt = msg_json
+                        # verify client's signature on their transcript hash
+                        client_transcript_hash_hex = client_receipt.get("transcript_sha256")
+                        client_sig_b64 = client_receipt.get("sig")
+                        # verify client's signature using their cert public key
+                        valid = sign.verify_signature(client_pub_key, bytes.fromhex(client_transcript_hash_hex), client_sig_b64)
+                        print(f"Client receipt signature valid: {valid}")
+
+                        # Now compute server's own transcript hash for this session and sign it
+                        concat = "".join(session_lines).encode("utf-8")
+                        server_transcript_hash = hashlib.sha256(concat).hexdigest()
+                        server_sig_b64 = sign.sign_message(server_private_key, bytes.fromhex(server_transcript_hash))
+
+                        # create server receipt JSON
+                        receipt = {
+                            "type": "receipt",
+                            "peer": "server",
+                            "first_seq": 1 if session_lines else 0,
+                            "last_seq": last_seqno,
+                            "transcript_sha256": server_transcript_hash,
+                            "sig": server_sig_b64
+                        }
+
+                        # save server transcript (already appended lines were written), write receipt file
+                        with open(SERVER_RECEIPT, "w", encoding="utf-8") as f:
+                            json.dump(receipt, f, indent=2)
+
+                        # send server receipt back to client
+                        conn.send(json.dumps(receipt).encode())
+                        print("Server receipt created and sent to client.")
+                        # keep serving? break to close
+                        break
+
                     if msg_json["type"] != "msg":
                         continue
+
                     seqno = msg_json["seqno"]
                     if seqno <= last_seqno:
                         print("Replay detected, ignoring message")
@@ -117,6 +181,11 @@ def handle_client(conn, addr):
                     plaintext = aeslib.aes_cbc_decrypt(iv_b64, ct_b64, session_key)
                     print(f"Received message [{seqno}]: {plaintext.decode()}")
 
+                    # Append this line to server's persistent transcript and in-memory session_lines
+                    line = f"{seqno}|{ts}|{ct_b64}|{sig_b64}|{client_fp}"
+                    append_to_file(SERVER_TRANSCRIPT, line)
+                    session_lines.append(line)
+
                     # Automatic reply to client
                     reply_text = f"Server received: {plaintext.decode()}"
                     iv_r, ct_r = aeslib.aes_cbc_encrypt(reply_text.encode(), session_key)
@@ -130,6 +199,12 @@ def handle_client(conn, addr):
                         "iv": iv_r,
                         "sig": sig_r
                     }
+
+                    # append reply line to transcript and in-memory session lines (peer fingerprint = client_fp)
+                    reply_line = f"{seqno}|{ts}|{ct_r}|{sig_r}|{client_fp}"
+                    append_to_file(SERVER_TRANSCRIPT, reply_line)
+                    session_lines.append(reply_line)
+
                     conn.send(json.dumps(reply_json).encode())
 
                 except Exception as e:

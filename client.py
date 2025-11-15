@@ -1,4 +1,4 @@
-# client.py (replace your current file)
+# client.py
 import socket
 import json
 from app.crypto import pki
@@ -25,13 +25,11 @@ def send_cert(sock):
     return True
 
 def do_dh_and_get_key(sock):
-    # generate params and A
     p, g = dhlib.generate_parameters()
     priv, A = dhlib.generate_private_and_public(p, g)
     msg = {"type": "dh_client", "p": str(p), "g": str(g), "A": str(A)}
     sock.send(json.dumps(msg).encode())
 
-    # receive server B
     resp = sock.recv(8192).decode()
     resp_json = json.loads(resp)
     if resp_json.get("type") != "dh_server":
@@ -42,14 +40,28 @@ def do_dh_and_get_key(sock):
     aes_key = derive_aes_key_from_shared(shared)
     return aes_key
 
+def do_session_dh(sock):
+    p, g = dhlib.generate_parameters()
+    priv, A = dhlib.generate_private_and_public(p, g)
+    msg = {"type": "dh_session", "p": str(p), "g": str(g), "A": str(A)}
+    sock.send(json.dumps(msg).encode())
+
+    resp = sock.recv(8192).decode()
+    resp_json = json.loads(resp)
+    if resp_json.get("type") != "dh_session_server":
+        raise RuntimeError("Session DH failed")
+    B = int(resp_json["B"])
+
+    shared = dhlib.compute_shared_secret(priv, B, p, g)
+    session_key = derive_aes_key_from_shared(shared)
+    print(f"Session key derived: {session_key.hex()}")  # ✅ Screenshot: client session key
+    return session_key
+
 def encrypt_and_send_payload(sock, aes_key, payload: dict, msg_type: str):
-    """
-    Encrypts a JSON payload, encodes IV + ciphertext as Base64, sends JSON to server.
-    """
-    plaintext = json.dumps(payload).encode()  # convert dict to bytes
+    plaintext = json.dumps(payload).encode()
     iv_b64, ct_b64 = aeslib.aes_cbc_encrypt(plaintext, aes_key)
-    send_json = {"type": msg_type, "iv": iv_b64, "ct": ct_b64}  # ✅ JSON-safe
-    sock.send(json.dumps(send_json).encode())  # send as bytes over socket
+    send_json = {"type": msg_type, "iv": iv_b64, "ct": ct_b64}
+    sock.send(json.dumps(send_json).encode())
     resp = sock.recv(4096).decode()
     print(resp)
 
@@ -75,6 +87,11 @@ def login_flow():
         password = input("Password: ")
         payload = {"email": email, "password": password}
         encrypt_and_send_payload(sock, aes_key, payload, "login")
+
+        # 6️⃣ SESSION KEY DH EXCHANGE
+        session_key = do_session_dh(sock)
+        # Use session_key for future chat messages (Step 4)
+        # ✅ Screenshot: session DH complete
 
 def main():
     print("Registration")

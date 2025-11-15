@@ -36,9 +36,9 @@ def handle_client(conn, addr):
         print(f"Rejected client certificate from {addr}")
         return
 
-    conn.send(b"CERT OK")  # ✅ Screenshot for report: certificate accepted
+    conn.send(b"CERT OK")  # ✅ Screenshot: certificate accepted
 
-    # 2️⃣ DH Key Exchange
+    # 2️⃣ DH Key Exchange (for registration/login)
     dh_msg = conn.recv(8192).decode()
     dh_json = json.loads(dh_msg)
     if dh_json.get("type") != "dh_client":
@@ -66,7 +66,6 @@ def handle_client(conn, addr):
         iv_b64 = enc_json.get("iv")
         ct_b64 = enc_json.get("ct")
 
-        # Decrypt AES-CBC with PKCS7 padding
         plaintext_bytes = aeslib.aes_cbc_decrypt(iv_b64, ct_b64, aes_key)
         payload = json.loads(plaintext_bytes.decode())  # ✅ Screenshot: decrypted payload
 
@@ -91,14 +90,35 @@ def handle_client(conn, addr):
         success, info = db.verify_login(email, password)
         conn.send(info.encode())  # ✅ Screenshot: server response to login
 
+        if success:
+            # 6️⃣ SESSION KEY DH EXCHANGE (after login)
+            dh_session_msg = conn.recv(8192).decode()
+            dh_sess_json = json.loads(dh_session_msg)
+            if dh_sess_json.get("type") != "dh_session":
+                conn.send(b"BAD SESSION DH")
+                conn.close()
+                return
+
+            p_sess = int(dh_sess_json["p"])
+            g_sess = int(dh_sess_json["g"])
+            A_sess = int(dh_sess_json["A"])
+
+            server_priv_sess, B_sess = dhlib.generate_private_and_public(p_sess, g_sess)
+            resp_sess = {"type": "dh_session_server", "B": str(B_sess)}
+            conn.send(json.dumps(resp_sess).encode())  # ✅ Screenshot: DH session exchange
+
+            shared_sess = dhlib.compute_shared_secret(server_priv_sess, A_sess, p_sess, g_sess)
+            session_key = derive_aes_key_from_shared(shared_sess)
+            print(f"Session key established with {addr}: {session_key.hex()}")  # ✅ Screenshot: session key derived
+
     else:
-        conn.send(b"UNKNOWN")  # Unexpected type
+        conn.send(b"UNKNOWN")
 
     conn.close()
 
 
 def main():
-    db.create_users_table()  # Ensure DB table exists
+    db.create_users_table()
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind((HOST, PORT))
         s.listen()

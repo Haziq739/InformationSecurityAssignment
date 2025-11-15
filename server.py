@@ -1,18 +1,26 @@
+# server.py
 import socket
 import json
 from app.storage import db
-from app.crypto import pki  # PKI validation
+from app.crypto import pki
+from app.crypto import dh as dhlib
+from app.crypto import aes as aeslib
 from cryptography import x509
+import hashlib
 
 HOST = '127.0.0.1'
 PORT = 12345
 
+def derive_aes_key_from_shared(shared_bytes: bytes) -> bytes:
+    """Derive 16-byte AES-128 key from shared DH secret using SHA256."""
+    digest = hashlib.sha256(shared_bytes).digest()
+    return digest[:16]
+
 def handle_client(conn, addr):
     print(f"Connected: {addr}")
 
-    # 1️⃣ Receive client certificate
+    # 1️⃣ Certificate Exchange and Validation
     client_cert_pem = conn.recv(4096)
-    
     try:
         client_cert = x509.load_pem_x509_certificate(client_cert_pem)
     except Exception as e:
@@ -28,29 +36,69 @@ def handle_client(conn, addr):
         print(f"Rejected client certificate from {addr}")
         return
 
-    conn.send(b"CERT OK")
+    conn.send(b"CERT OK")  # ✅ Screenshot for report: certificate accepted
 
-    # 2️⃣ Receive registration/login JSON
+    # 2️⃣ DH Key Exchange
+    dh_msg = conn.recv(8192).decode()
+    dh_json = json.loads(dh_msg)
+    if dh_json.get("type") != "dh_client":
+        conn.send(b"BAD DH")
+        conn.close()
+        return
+
+    p = int(dh_json["p"])
+    g = int(dh_json["g"])
+    A = int(dh_json["A"])
+
+    server_priv, B = dhlib.generate_private_and_public(p, g)
+    # Send server DH public value
+    resp = {"type": "dh_server", "B": str(B)}
+    conn.send(json.dumps(resp).encode())  # ✅ Screenshot: DH exchange
+
+    shared = dhlib.compute_shared_secret(server_priv, A, p, g)
+    aes_key = derive_aes_key_from_shared(shared)
+
+    # 3️⃣ Receive Encrypted Payload (Registration/Login)
+    enc_msg = conn.recv(8192).decode()
     try:
-        msg = conn.recv(4096).decode()
-        data = json.loads(msg)
+        enc_json = json.loads(enc_msg)
+        msg_type = enc_json.get("type")
+        iv_b64 = enc_json.get("iv")
+        ct_b64 = enc_json.get("ct")
 
-        if data["type"] == "register":
-            success, info = db.register_user(data["email"], data["username"], data["password"])
-            conn.send(info.encode())
-        elif data["type"] == "login":
-            success, info = db.verify_login(data["email"], data["password"])
-            conn.send(info.encode())
-        else:
-            conn.send(b"Unknown message type")
+        # Decrypt AES-CBC with PKCS7 padding
+        plaintext_bytes = aeslib.aes_cbc_decrypt(iv_b64, ct_b64, aes_key)
+        payload = json.loads(plaintext_bytes.decode())  # ✅ Screenshot: decrypted payload
+
     except Exception as e:
-        print(f"Error handling client message: {e}")
-        conn.send(b"Error")
-    
+        print("Decryption failed:", e)
+        conn.send(b"DECRYPT FAIL")
+        conn.close()
+        return
+
+    # 4️⃣ Handle Registration
+    if msg_type == "register":
+        email = payload.get("email")
+        username = payload.get("username")
+        password = payload.get("password")
+        success, info = db.register_user(email, username, password)
+        conn.send(info.encode())  # ✅ Screenshot: server response to registration
+
+    # 5️⃣ Handle Login
+    elif msg_type == "login":
+        email = payload.get("email")
+        password = payload.get("password")
+        success, info = db.verify_login(email, password)
+        conn.send(info.encode())  # ✅ Screenshot: server response to login
+
+    else:
+        conn.send(b"UNKNOWN")  # Unexpected type
+
     conn.close()
 
+
 def main():
-    db.create_users_table()
+    db.create_users_table()  # Ensure DB table exists
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind((HOST, PORT))
         s.listen()
